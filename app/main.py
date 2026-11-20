@@ -15,6 +15,7 @@ from starlette.background import BackgroundTask
 
 from .sample_image import build_sample_image
 from .unpacker import CHUNK, UnpackError, unpack_image
+from .volume_seed import build_volume_seed
 
 logger = logging.getLogger("oci-unpacker")
 
@@ -48,7 +49,8 @@ app = FastAPI(
         "* hardlink overwrite is byte-safe for the other end;\n"
         "* paths and links can never escape the per-request sandbox;\n"
         "* any missing/corrupt/illegal input fails the whole request.\n\n"
-        "Try it: download `GET /sample-image`, then upload it to `POST /unpack`."
+        "Try it: download `GET /sample-image`, then upload it to `POST /unpack` "
+        "or `POST /volume-seed`."
     ),
     lifespan=lifespan,
 )
@@ -61,6 +63,7 @@ def root():
         "docs": "/docs",
         "endpoints": {
             "unpack": "POST /unpack",
+            "volume_seed": "POST /volume-seed",
             "sample_image": "GET /sample-image",
             "healthz": "GET /healthz",
         },
@@ -76,7 +79,8 @@ def healthz():
     "/sample-image",
     summary="Download a sample OCI Image Layout tar",
     response_description="sample-image.tar -- a single-manifest OCI Image Layout "
-    "with deletions, an opaque directory and a hardlink overwrite",
+    "with deletions, an opaque directory, a hardlink overwrite and two nested "
+    "volumes with a hardlink crossing their boundary",
     responses={200: {"content": {"application/x-tar": {}}}},
 )
 def sample_image():
@@ -123,5 +127,47 @@ def unpack(
         rootfs_tar,
         media_type="application/x-tar",
         filename="rootfs.tar",
+        background=BackgroundTask(partial(shutil.rmtree, work, ignore_errors=True)),
+    )
+
+
+@app.post(
+    "/volume-seed",
+    summary="Unpack an OCI Image Layout tar and seed its declared volumes",
+    response_description=(
+        "seed-bundle.tar containing rootfs.tar, one seed tar per declared "
+        "volume (config.Volumes) and mounts.json"
+    ),
+    responses={
+        200: {"content": {"application/x-tar": {}}},
+        400: {
+            "description": "Missing blobs, corrupt data, digest/diff_id "
+            "mismatch, illegal paths or an invalid declared volume -- nothing "
+            "is returned."
+        },
+    },
+)
+def volume_seed(
+    file: UploadFile = File(
+        ..., description="OCI Image Layout tar containing exactly one manifest"
+    ),
+):
+    work = tempfile.mkdtemp(prefix="req-", dir=WORK_ROOT)
+    try:
+        upload_path = os.path.join(work, "upload.tar")
+        with open(upload_path, "wb") as out:
+            shutil.copyfileobj(file.file, out, CHUNK)
+        bundle = build_volume_seed(upload_path, work, os.path.join(work, "bundle.tar"))
+    except UnpackError as exc:
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        logger.exception("unexpected error while seeding volumes")
+        raise HTTPException(status_code=500, detail="internal error")
+    return FileResponse(
+        bundle,
+        media_type="application/x-tar",
+        filename="seed-bundle.tar",
         background=BackgroundTask(partial(shutil.rmtree, work, ignore_errors=True)),
     )

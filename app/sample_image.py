@@ -11,7 +11,12 @@ tar) and exercises every tricky behaviour of the unpacker:
 * one end of a hardlink pair being overwritten -- the other end must keep
   its original bytes;
 * relative and absolute symlinks;
-* permission bits (0755 executables, 0600 secrets, 0700 directory).
+* permission bits (0755 executables, 0600 secrets, 0700 directory);
+* two declared volumes, nested two levels deep (``/srv/data`` and
+  ``/srv/data/cache``) plus image content in ``/srv`` that must never be
+  mistaken for volume data;
+* one hardlink group spanning both volumes (``srv/data/shared.bin`` and
+  ``srv/data/cache/shared.bin``) and one inside a volume only.
 
 Expected final rootfs::
 
@@ -23,6 +28,12 @@ Expected final rootfs::
     etc/motd                "hello from sample image\n"
     etc/motd-link           symlink -> "/etc/motd"
     secret/public.txt       "now public\n"         (opaque dir: token.txt is gone)
+    srv/data/shared.bin     "cross-volume payload\n"
+    srv/data/cache/shared.bin  hardlink to srv/data/shared.bin
+    srv/data/cache/notes.txt   "cache notes\n"
+    srv/data/cache/twin.txt    hardlink to srv/data/cache/notes.txt
+
+``config.Volumes`` declares ``/srv/data`` and ``/srv/data/cache``.
 
 Removed from the lower layer: ``app/config.txt``, ``app/data/remove.txt``,
 ``secret/token.txt``.
@@ -100,6 +111,19 @@ def _layer1_tar() -> bytes:
         _add_file(tf, "app/data/rebuilt.txt", b"rebuilt: old\n")
         _add_dir(tf, "secret", 0o700)
         _add_file(tf, "secret/token.txt", b"secret-token\n", 0o600)
+        # two nested volumes plus plain image content in their parent
+        _add_dir(tf, "srv")
+        _add_file(tf, "srv/config.yml", b"image: sample\n")
+        _add_dir(tf, "srv/data")
+        _add_file(tf, "srv/data/shared.bin", b"cross-volume payload\n")
+        _add_file(tf, "srv/data/old.txt", b"old volume data\n")
+        _add_symlink(tf, "srv/data/shared-link", "shared.bin")
+        _add_dir(tf, "srv/data/cache")
+        _add_file(tf, "srv/data/cache/notes.txt", b"cache notes\n")
+        _add_hardlink(tf, "srv/data/cache/twin.txt", "srv/data/cache/notes.txt")
+        # same inode as srv/data/shared.bin: a hardlink group spanning both
+        # volumes
+        _add_hardlink(tf, "srv/data/cache/shared.bin", "srv/data/shared.bin")
     return buf.getvalue()
 
 
@@ -135,6 +159,10 @@ def build_sample_image(dest_path: str) -> None:
         "rootfs": {
             "type": "layers",
             "diff_ids": [f"sha256:{_sha256(layer1)}", f"sha256:{_sha256(layer2)}"],
+        },
+        "Volumes": {
+            "/srv/data": {},
+            "/srv/data/cache": {},
         },
         "history": [
             {"created": "2026-01-01T00:00:00Z", "comment": "base layer (gzip)"},

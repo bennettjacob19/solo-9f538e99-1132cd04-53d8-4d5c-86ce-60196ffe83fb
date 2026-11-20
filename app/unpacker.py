@@ -189,7 +189,11 @@ def _prepare_layer(blob_path, media_type, expected_diff_id, workdir, index):
 
 
 def load_and_verify(layout_dir, workdir):
-    """Verify the whole layout; return ordered list of plain layer tar paths."""
+    """Verify the whole layout.
+
+    Returns ``(layer_tar_paths, config)``: the ordered list of plain layer
+    tar paths and the verified image config JSON object.
+    """
     _read_json(os.path.join(layout_dir, "oci-layout"), "oci-layout")
     index = _read_json(os.path.join(layout_dir, "index.json"), "index.json")
     manifests = index.get("manifests") if isinstance(index, dict) else None
@@ -239,7 +243,7 @@ def load_and_verify(layout_dir, workdir):
         tar_paths.append(
             _prepare_layer(lpath, ldesc.get("mediaType"), diff_ids[i], workdir, i)
         )
-    return tar_paths
+    return tar_paths, config
 
 
 # ---------------------------------------------------------------------------
@@ -499,20 +503,85 @@ def _apply_deferred_dir_meta(dir_meta):
 # ---------------------------------------------------------------------------
 
 
-def _tar_add(tf, rootfs, rel, inode_map):
-    full = os.path.join(rootfs, rel)
+def build_rootfs_tar(rootfs, out_path, exclude=None):
+    """Tar the whole rootfs.
+
+    Paths listed in *exclude* (rootfs-relative) must be present but are
+    emitted as empty directory entries without being descended into.
+    """
+    exclude = set(exclude or ())
+    tmp = out_path + ".tmp"
+    with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as tf:
+        inode_map = {}
+        for child in sorted(os.listdir(rootfs)):
+            full = os.path.join(rootfs, child)
+            if child in exclude:
+                _tar_empty_dir(tf, full, child)
+            else:
+                _tar_walk(tf, full, child, exclude, inode_map)
+    os.replace(tmp, out_path)
+
+
+def build_subtree_tar(rootfs, rel, out_path, exclude=None):
+    """Tar the subtree at *rel*, with names relative to that directory.
+
+    *exclude* holds rootfs-relative paths that must appear as empty
+    directories but are not descended into (nested mount points).
+    """
+    exclude = set(exclude or ())
+    root_abs = os.path.join(rootfs, rel) if rel else rootfs
+    tmp = out_path + ".tmp"
+    with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as tf:
+        inode_map = {}
+        for child in sorted(os.listdir(root_abs)):
+            full = os.path.join(root_abs, child)
+            arc = rel + "/" + child
+            if arc in exclude:
+                _tar_empty_dir(tf, full, child)
+            else:
+                _tar_walk(tf, full, child, exclude, inode_map, arc)
+    os.replace(tmp, out_path)
+
+
+def _tar_empty_dir(tf, full, arc):
     st = os.lstat(full)
-    ti = tarfile.TarInfo(rel)
-    ti.mode = stat.S_IMODE(st.st_mode)
-    ti.mtime = int(st.st_mtime)
-    ti.uid = st.st_uid
-    ti.gid = st.st_gid
-    if stat.S_ISDIR(st.st_mode):
-        ti.type = tarfile.DIRTYPE
-        tf.addfile(ti)
-        for child in sorted(os.listdir(full)):
-            _tar_add(tf, rootfs, rel + "/" + child, inode_map)
-    elif stat.S_ISLNK(st.st_mode):
+    ti = tarfile.TarInfo(arc)
+    _fill_tarinfo(ti, st)
+    ti.type = tarfile.DIRTYPE
+    tf.addfile(ti)
+
+
+def _tar_walk(tf, full, arc, exclude, inode_map, rootfs_arc=None):
+    """Archive *full* as *arc*; stop at excluded directories.
+
+    *rootfs_arc* is the rootfs-relative path of *arc* (equal to *arc* when
+    building the whole rootfs); it is what *exclude* is matched against.
+    """
+    st = os.lstat(full)
+    if not stat.S_ISDIR(st.st_mode):
+        _tar_add_leaf(tf, full, arc, inode_map)
+        return
+    ti = tarfile.TarInfo(arc)
+    _fill_tarinfo(ti, st)
+    ti.type = tarfile.DIRTYPE
+    tf.addfile(ti)
+    for child in sorted(os.listdir(full)):
+        child_arc = arc + "/" + child
+        child_rootfs_arc = (rootfs_arc or arc) + "/" + child
+        if child_rootfs_arc in exclude:
+            _tar_empty_dir(tf, os.path.join(full, child), child_arc)
+        else:
+            _tar_walk(
+                tf, os.path.join(full, child), child_arc, exclude, inode_map,
+                child_rootfs_arc,
+            )
+
+
+def _tar_add_leaf(tf, full, arc, inode_map):
+    st = os.lstat(full)
+    ti = tarfile.TarInfo(arc)
+    _fill_tarinfo(ti, st)
+    if stat.S_ISLNK(st.st_mode):
         ti.type = tarfile.SYMTYPE
         ti.linkname = os.readlink(full)
         tf.addfile(ti)
@@ -524,7 +593,7 @@ def _tar_add(tf, rootfs, rel, inode_map):
             tf.addfile(ti)
         else:
             if st.st_nlink > 1:
-                inode_map[key] = rel
+                inode_map[key] = arc
             ti.type = tarfile.REGTYPE
             ti.size = st.st_size
             with open(full, "rb") as f:
@@ -543,15 +612,14 @@ def _tar_add(tf, rootfs, rel, inode_map):
         ti.devminor = os.minor(st.st_rdev)
         tf.addfile(ti)
     else:
-        raise UnpackError(f"unsupported file type in rootfs: {rel}")
+        raise UnpackError(f"unsupported file type in rootfs: {arc}")
 
 
-def build_rootfs_tar(rootfs, out_path):
-    tmp = out_path + ".tmp"
-    with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as tf:
-        for child in sorted(os.listdir(rootfs)):
-            _tar_add(tf, rootfs, child, {})
-    os.replace(tmp, out_path)
+def _fill_tarinfo(ti, st):
+    ti.mode = stat.S_IMODE(st.st_mode)
+    ti.mtime = int(st.st_mtime)
+    ti.uid = st.st_uid
+    ti.gid = st.st_gid
 
 
 # ---------------------------------------------------------------------------
@@ -559,15 +627,16 @@ def build_rootfs_tar(rootfs, out_path):
 # ---------------------------------------------------------------------------
 
 
-def unpack_image(upload_path, workdir):
-    """Unpack the uploaded layout tar; return the path of the rootfs.tar.
+def prepare_rootfs(upload_path, workdir):
+    """Verify the upload and materialize its final rootfs tree.
 
-    Raises UnpackError on any problem; nothing is returned in that case.
+    Returns ``(rootfs_dir, config)`` where *config* is the verified image
+    config JSON object.  Raises UnpackError on any problem.
     """
     layout_dir = os.path.join(workdir, "layout")
     os.makedirs(layout_dir)
     extract_layout(upload_path, layout_dir)
-    layer_tars = load_and_verify(layout_dir, workdir)
+    layer_tars, config = load_and_verify(layout_dir, workdir)
 
     rootfs = os.path.join(workdir, "rootfs")
     os.makedirs(rootfs)
@@ -575,7 +644,15 @@ def unpack_image(upload_path, workdir):
     for tar_path in layer_tars:
         apply_layer(tar_path, rootfs, dir_meta)
     _apply_deferred_dir_meta(dir_meta)
+    return rootfs, config
 
+
+def unpack_image(upload_path, workdir):
+    """Unpack the uploaded layout tar; return the path of the rootfs.tar.
+
+    Raises UnpackError on any problem; nothing is returned in that case.
+    """
+    rootfs, _config = prepare_rootfs(upload_path, workdir)
     out_path = os.path.join(workdir, "rootfs.tar")
     build_rootfs_tar(rootfs, out_path)
     return out_path

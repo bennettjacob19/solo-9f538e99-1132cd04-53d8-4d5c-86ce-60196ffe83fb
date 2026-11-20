@@ -448,3 +448,240 @@ def test_hardlink_pair_preserved_in_output(client, sample):
     else:
         assert b == ("file", b"shared\n")
         assert a == ("hardlink", "app/data/alias.txt")
+
+
+# ---------------------------------------------------------------------------
+# volume seeding (POST /volume-seed)
+# ---------------------------------------------------------------------------
+
+MT_CONFIG = "application/vnd.oci.image.config.v1+json"
+
+
+def seed(client, data: bytes):
+    return client.post(
+        "/volume-seed", files={"file": ("image.tar", data, "application/x-tar")}
+    )
+
+
+def read_bundle(content: bytes):
+    """{name: bytes} for the bundle members; mounts.json decoded."""
+    members = read_layout(content)
+    mounts = json.loads(members.pop("mounts.json"))["mounts"]
+    return members, mounts
+
+
+def read_tar_members(content: bytes):
+    """{name: (kind, payload)} for a package tar, keeping dir entries."""
+    result = {}
+    with tarfile.open(fileobj=io.BytesIO(content), mode="r:") as tf:
+        for m in tf.getmembers():
+            if m.isdir():
+                result[m.name] = ("dir", None)
+            elif m.issym():
+                result[m.name] = ("symlink", m.linkname)
+            elif m.islnk():
+                result[m.name] = ("hardlink", m.linkname)
+            elif m.isreg():
+                result[m.name] = ("file", tf.extractfile(m).read())
+    return result
+
+
+def test_sample_volume_seed(client, sample):
+    r = seed(client, sample)
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/x-tar"
+    members, mounts = read_bundle(r.content)
+
+    # mounts.json: parents before children, paths are the declared ones
+    assert [m["path"] for m in mounts] == ["/srv/data", "/srv/data/cache"]
+    names = [m["file"] for m in mounts]
+    assert len(set(names)) == 2
+    assert set(members) == {"rootfs.tar", *names}
+
+    # rootfs.tar: full tree, but every mount point is an empty directory
+    fs = read_tar_members(members["rootfs.tar"])
+    assert fs["srv/config.yml"] == ("file", b"image: sample\n")
+    assert fs["srv/data"] == ("dir", None)
+    assert "srv/data/shared.bin" not in fs
+    assert "srv/data/old.txt" not in fs
+    # the nested mount point is not reached: its parent was emptied
+    assert "srv/data/cache" not in fs
+    assert "srv/data/cache/shared.bin" not in fs
+    assert "srv/data/cache/notes.txt" not in fs
+
+    # parent volume seed: no nested mount content, everything else kept,
+    # paths relative to the volume root
+    parent = read_tar_members(members[names[0]])
+    assert parent["shared.bin"] == ("file", b"cross-volume payload\n")
+    assert parent["old.txt"] == ("file", b"old volume data\n")
+    assert parent["shared-link"] == ("symlink", "shared.bin")
+    assert parent["cache"] == ("dir", None)
+    assert "cache/shared.bin" not in parent
+    assert "cache/notes.txt" not in parent
+
+    # child volume seed: only its own content, hardlink preserved inside it
+    child = read_tar_members(members[names[1]])
+    assert child["notes.txt"] == ("file", b"cache notes\n")
+    assert child["twin.txt"] == ("hardlink", "notes.txt")
+    # cross-volume hardlink: the child stores its own copy of the bytes
+    assert child["shared.bin"] == ("file", b"cross-volume payload\n")
+    assert "config.yml" not in child
+
+
+def test_sample_volume_seed_rootfs_links(client, sample):
+    r = seed(client, sample)
+    members, _mounts = read_bundle(r.content)
+    fs = read_tar_members(members["rootfs.tar"])
+    # the in-rootfs hardlink pair stays a hardlink, the symlink is verbatim
+    assert fs["bin/tool"] == ("file", b"tool-v2\n")
+    assert fs["bin/tool-link"] == ("file", b"tool-v1\n")
+    assert fs["etc/motd-link"] == ("symlink", "/etc/motd")
+    assert fs["app/data/rebuilt.txt"] == ("file", b"rebuilt: new\n")
+    assert "app/config.txt" not in fs
+
+
+def _set_volumes(sample, volumes):
+    ed = LayoutEditor(sample)
+    cfg = ed.config()
+    cfg["Volumes"] = volumes
+    ed.set_config(cfg)
+    return ed.to_bytes()
+
+
+def test_no_volumes_declared(client, sample):
+    r = seed(client, _set_volumes(sample, {}))
+    assert r.status_code == 200, r.text
+    members, mounts = read_bundle(r.content)
+    assert mounts == []
+    assert set(members) == {"rootfs.tar"}
+    fs = read_tar_members(members["rootfs.tar"])
+    # without declared volumes nothing is truncated
+    assert fs["srv/data/cache/notes.txt"] == ("file", b"cache notes\n")
+    assert fs["srv/data/cache/twin.txt"] == (
+        "hardlink", "srv/data/cache/notes.txt")
+
+
+def test_volumes_absent_when_key_missing(client, sample):
+    ed = LayoutEditor(sample)
+    cfg = ed.config()
+    cfg.pop("Volumes")
+    ed.set_config(cfg)
+    r = seed(client, ed.to_bytes())
+    assert r.status_code == 200, r.text
+    _members, mounts = read_bundle(r.content)
+    assert mounts == []
+
+
+@pytest.mark.parametrize(
+    "value, needle",
+    [
+        ("/srv/missing", "not a directory"),
+        ("/etc/motd", "not a directory"),
+        ("/etc/motd-link", "not a directory"),
+        ("srv/data", "must be absolute"),
+        ("/", "root directory"),
+        ("/srv/../etc", "not contain '..'"),
+    ],
+)
+def test_invalid_volume_declared(client, sample, value, needle):
+    r = seed(client, _set_volumes(sample, {value: {}}))
+    assert r.status_code == 400
+    assert needle in r.json()["detail"]
+
+
+def test_volume_through_symlink_rejected(client, sample):
+    # replace the volume directory by a symlink pointing elsewhere
+    layer = make_layer([
+        ("srv/data", "symlink", "/tmp"),
+    ])
+    ed = LayoutEditor(sample)
+    ed.set_layer_blob(1, MT_LAYER, layer)
+    cfg = ed.config()
+    cfg["rootfs"]["diff_ids"][1] = f"sha256:{sha256(layer)}"
+    cfg["Volumes"] = {"/srv/data": {}, "/srv/data/cache": {}}
+    ed.set_config(cfg)
+    r = seed(client, ed.to_bytes())
+    # /srv/data -> /tmp which does not exist in the rootfs: not a directory
+    assert r.status_code == 400
+    assert "not a directory" in r.json()["detail"]
+
+
+def test_volume_seed_verification_failure(client, sample):
+    ed = LayoutEditor(sample)
+    ed.set_layer_blob(0, MT_LAYER_GZ, b"not gzip")
+    r = seed(client, ed.to_bytes())
+    assert r.status_code == 400
+    # the service stays healthy afterwards
+    assert seed(client, sample).status_code == 200
+
+
+def test_mounts_order_parents_first(client, sample):
+    # declare the child before the parent: output must still be parent-first
+    r = seed(client, _set_volumes(sample, {
+        "/srv/data/cache": {},
+        "/srv/data": {},
+    }))
+    assert r.status_code == 200, r.text
+    members, mounts = read_bundle(r.content)
+    assert [m["path"] for m in mounts] == ["/srv/data", "/srv/data/cache"]
+    for m in mounts:
+        assert m["file"] in members
+        # each seed can be opened independently
+        read_tar_members(members[m["file"]])
+
+
+def test_volume_path_normalized(client, sample):
+    r = seed(client, _set_volumes(sample, {"/srv//data/./cache/": {}}))
+    assert r.status_code == 200, r.text
+    _members, mounts = read_bundle(r.content)
+    assert [m["path"] for m in mounts] == ["/srv//data/./cache/"]
+    assert mounts[0]["file"].endswith(".tar")
+
+
+def test_empty_volume_seed(client, sample):
+    layer = make_layer([
+        ("srv/data/emptydir", "dir", None),
+        ("srv/data/.wh..wh..opq", "file", b""),
+    ])
+    ed = LayoutEditor(sample)
+    ed.set_layer_blob(1, MT_LAYER, layer)
+    cfg = ed.config()
+    cfg["rootfs"]["diff_ids"][1] = f"sha256:{sha256(layer)}"
+    ed.set_config(cfg)
+    # the opaque marker wiped the nested volume directory: a declared
+    # volume that is gone from the final tree is an error, not an empty seed
+    r = seed(client, ed.to_bytes())
+    assert r.status_code == 400
+    assert "not a directory" in r.json()["detail"]
+
+
+def test_mounts_order_three_levels(client, sample):
+    # add a third-level volume below the child one; declaration order is
+    # child, grandchild, parent -- output must be strictly parents-first
+    layer = make_layer([
+        ("srv/data/cache/deep", "dir", None),
+        ("srv/data/cache/deep/x.txt", "file", b"deep\n"),
+    ])
+    ed = LayoutEditor(sample)
+    ed.set_layer_blob(1, MT_LAYER, layer)
+    cfg = ed.config()
+    cfg["rootfs"]["diff_ids"][1] = f"sha256:{sha256(layer)}"
+    cfg["Volumes"] = {
+        "/srv/data/cache/deep": {},
+        "/srv/data/cache": {},
+        "/srv/data": {},
+    }
+    ed.set_config(cfg)
+    r = seed(client, ed.to_bytes())
+    assert r.status_code == 200, r.text
+    members, mounts = read_bundle(r.content)
+    assert [m["path"] for m in mounts] == [
+        "/srv/data", "/srv/data/cache", "/srv/data/cache/deep"]
+    grandchild = mounts[2]["file"]
+    grandchild_fs = read_tar_members(members[grandchild])
+    assert grandchild_fs["x.txt"] == ("file", b"deep\n")
+    # parent truncates the child entirely; child keeps deep as an empty dir
+    assert "cache" in read_tar_members(members[mounts[0]["file"]])
+    child_fs = read_tar_members(members[mounts[1]["file"]])
+    assert child_fs["deep"] == ("dir", None)
+    assert "deep/x.txt" not in child_fs
